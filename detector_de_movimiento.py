@@ -9,15 +9,22 @@ from tkinter import simpledialog
 
 # Variables de control
 draw_pose = True
+show_text = True
 timer_running = False
 timer_seconds = 0
 timer_start_time = 0
 alarm_sounding = False
 
-# Inicializar MediaPipe Pose
+# Inicializar MediaPipe Pose con configuración mejorada
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
-pose = mp_pose.Pose(model_complexity=1, enable_segmentation=False, smooth_landmarks=True)
+pose = mp_pose.Pose(
+    model_complexity=2,  # Usar el modelo más complejo para mejor precisión
+    enable_segmentation=True,  # Habilitar segmentación para mejor detección
+    smooth_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
 # Captura de cámara local
 cap_cam = cv2.VideoCapture(0)
@@ -75,11 +82,35 @@ while True:
         break
 
     # ---- Procesamiento con MediaPipe ----
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # Redimensionar la imagen para mejorar el rendimiento
+    height, width = frame.shape[:2]
+    frame_resized = cv2.resize(frame, (int(width * 0.8), int(height * 0.8)))
+    frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+    
+    # Procesar con MediaPipe
     results = pose.process(frame_rgb)
 
-    if results.pose_landmarks and draw_pose:
-        mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+    if results.pose_landmarks:
+        if draw_pose:
+            # Dibujar landmarks con diferentes colores para diferentes partes del cuerpo
+            mp_drawing.draw_landmarks(
+                frame_resized, 
+                results.pose_landmarks,
+                mp_pose.POSE_CONNECTIONS,
+                landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2)
+            )
+            # Resaltar puntos clave de las piernas
+            if results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_HIP.value]:
+                cv2.circle(frame_resized, 
+                         (int(results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_HIP.value].x * frame_resized.shape[1]),
+                          int(results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_HIP.value].y * frame_resized.shape[0])),
+                          8, (0, 0, 255), -1)
+            
+            # Añadir más puntos clave según sea necesario
+            
+    # Volver al tamaño original
+    frame = cv2.resize(frame_resized, (width, height))
 
     # ---- Detección de movimiento ----
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -112,12 +143,14 @@ while True:
         cv2.putText(frame, timer_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255) if remaining < 10 else (0, 255, 0), 2)
     
     # Mostrar estado actual en la pantalla
-    status_text = "Lineas: ACTIVADAS" if draw_pose else "Lineas: DESACTIVADAS"
-    cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    cv2.putText(frame, "S: Mostrar lineas  H: Ocultar lineas", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(frame, "Q o ESC: Salir", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(frame, "T: Configurar tiempo", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(frame, "Espacio: Iniciar/Detener", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    if show_text:
+        status_text = "Lineas: ACTIVADAS" if draw_pose else "Lineas: DESACTIVADAS"
+        cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        cv2.putText(frame, "S: Mostrar lineas  H: Ocultar lineas", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, "Q o ESC: Salir", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, "T: Configurar tiempo", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, "Espacio: Iniciar/Detener", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, "D: Mostrar/Ocultar texto", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     # Mostrar en ventana
     cv2.imshow("Detector Movimiento OBS", frame)
@@ -152,6 +185,9 @@ while True:
             print(f"Tiempo configurado a {timer_seconds//60} minutos")
         else:
             print("Configuración de tiempo cancelada")
+    elif key in (ord('d'), ord('D')):  # Mostrar/ocultar texto
+        show_text = not show_text
+        print(f"Texto {'mostrado' if show_text else 'ocultado'}")
 
 cap_cam.release()
 cv2.destroyAllWindows()
