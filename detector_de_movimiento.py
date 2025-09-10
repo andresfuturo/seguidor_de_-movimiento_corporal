@@ -5,7 +5,11 @@ import time
 import threading
 import winsound
 import tkinter as tk
-from tkinter import simpledialog
+from tkinter import simpledialog, messagebox
+import requests
+from requests.auth import HTTPBasicAuth
+from queue import Queue
+from threading import Thread
 
 # Variables de control
 draw_pose = True
@@ -14,6 +18,12 @@ timer_running = False
 timer_seconds = 0
 timer_start_time = 0
 alarm_sounding = False
+
+# Configuración de la cámara
+CAMERA_TYPE = "pc"  # "pc" o "phone"
+PHONE_IP = "192.168.20.111:4747"  # IP y puerto del celular
+frame_queue = Queue(maxsize=1)
+stop_thread = False
 
 # Inicializar MediaPipe Pose con configuración mejorada
 mp_pose = mp.solutions.pose
@@ -26,12 +36,127 @@ pose = mp_pose.Pose(
     min_tracking_confidence=0.5
 )
 
-# Captura de cámara local
-cap_cam = cv2.VideoCapture(0)
+def setup_pc_camera():
+    """Configura la cámara web del PC"""
+    print("🔍 Configurando cámara del PC...")
+    
+    # Listar todas las cámaras disponibles
+    index = 0
+    arr = []
+    while index < 3:  # Revisar las primeras 3 cámaras
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        if cap.read()[0]:
+            arr.append(index)
+            cap.release()
+        index += 1
+    
+    print(f"Cámaras disponibles: {arr}")
+    
+    # Intentar con la cámara 1 primero (índice 1)
+    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+    
+    # Si no se pudo abrir, intentar con la cámara 0
+    if not cap.isOpened() or not cap.read()[0]:
+        print("No se pudo abrir la cámara 1, intentando con la cámara 0...")
+        cap.release()
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    
+    if not cap.isOpened() or not cap.read()[0]:
+        print("❌ No se pudo abrir ninguna cámara del PC")
+        return None
+    
+    # Configurar resolución
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    print(f"✅ Cámara del PC configurada correctamente (índice {1 if cap.isOpened() else 0})")
+    return cap
 
-if not cap_cam.isOpened():
-    print("❌ No se pudo abrir la cámara")
+def phone_stream_worker():
+    """Hilo para capturar el stream del celular"""
+    global stop_thread, frame_queue
+    url = f'http://{PHONE_IP}/video'
+    bytes_data = bytes()
+    
+    while not stop_thread:
+        try:
+            with requests.get(url, stream=True, timeout=5) as response:
+                for chunk in response.iter_content(chunk_size=1024):
+                    if stop_thread:
+                        break
+                    if chunk:
+                        bytes_data += chunk
+                        a = bytes_data.find(b'\xff\xd8')
+                        b = bytes_data.find(b'\xff\xd9')
+                        
+                        if a != -1 and b != -1:
+                            jpg = bytes_data[a:b+2]
+                            bytes_data = bytes_data[b+2:]
+                            frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if frame is not None:
+                                if frame_queue.full():
+                                    frame_queue.get()
+                                frame_queue.put(frame)
+        except Exception as e:
+            print(f"Error en el stream del celular: {e}")
+            time.sleep(1)
+
+def setup_phone_camera():
+    """Configura la cámara del celular"""
+    global stop_thread
+    print(f"📱 Intentando conectar al celular en {PHONE_IP}...")
+    
+    # Iniciar el hilo para el stream del celular
+    stop_thread = False
+    stream_thread = Thread(target=phone_stream_worker, daemon=True)
+    stream_thread.start()
+    
+    # Esperar a que llegue el primer frame
+    start_time = time.time()
+    while frame_queue.empty():
+        if time.time() - start_time > 10:  # Timeout de 10 segundos
+            stop_thread = True
+            stream_thread.join(timeout=1)
+            print("❌ No se pudo conectar con el celular")
+            return None
+        time.sleep(0.1)
+    
+    print("✅ Conexión exitosa con el celular")
+    return "phone"  # Retornamos un marcador ya que no usamos cap_cam para el celular
+
+def select_camera():
+    """Muestra un diálogo para seleccionar la cámara"""
+    root = tk.Tk()
+    root.withdraw()
+    
+    # Crear un diálogo personalizado
+    choice = simpledialog.askstring(
+        "Seleccionar Cámara",
+        "Seleccione la cámara a utilizar:\n\n"
+        "1: Usar cámara del celular (vía WiFi)\n"
+        "2: Usar cámara web del PC\n\n"
+        "Ingrese 1 o 2:"
+    )
+    
+    if choice == '1':
+        return setup_phone_camera()
+    elif choice == '2':
+        return setup_pc_camera()
+    else:
+        messagebox.showerror("Error", "Opción no válida. Saliendo del programa.")
+        return None
+
+# Seleccionar y configurar la cámara
+camera = select_camera()
+if camera is None:
+    print("No se pudo inicializar ninguna cámara")
     exit()
+
+# Inicializar según el tipo de cámara
+if camera == "phone":
+    cap_cam = None  # No usamos cap_cam para el teléfono
+else:
+    cap_cam = camera
 
 # Variables para detección de movimiento
 prev_gray = None
@@ -77,9 +202,18 @@ def set_timer():
 
 while True:
     current_time = time.time()
-    ret, frame = cap_cam.read()
-    if not ret:
-        break
+    
+    # Obtener frame según la cámara seleccionada
+    if camera == "phone":
+        if frame_queue.empty():
+            continue
+        frame = frame_queue.get()
+        ret = True
+    else:
+        ret, frame = cap_cam.read()
+        if not ret:
+            print("Error al capturar frame de la cámara del PC")
+            break
 
     # ---- Procesamiento con MediaPipe ----
     # Redimensionar la imagen para mejorar el rendimiento
@@ -127,22 +261,30 @@ while True:
         prev_gray = gray
 
     # Actualizar y mostrar el cronómetro
-    if timer_running:
-        elapsed = current_time - timer_start_time
-        remaining = max(0, timer_seconds - int(elapsed))
-        
-        if remaining <= 0 and not alarm_sounding:
-            # Tiempo terminado, activar alarma
-            timer_running = False
-            threading.Thread(target=play_alarm, daemon=True).start()
-            remaining = 0
-        
-        # Mostrar tiempo restante
-        mins, secs = divmod(remaining, 60)
-        timer_text = f'Tiempo: {mins:02d}:{secs:02d}'
-        cv2.putText(frame, timer_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255) if remaining < 10 else (0, 255, 0), 2)
+    elapsed = current_time - timer_start_time if timer_running else 0
+    remaining = max(0, timer_seconds - int(elapsed))
     
-    # Mostrar estado actual en la pantalla
+    if timer_running and remaining <= 0 and not alarm_sounding:
+        # Tiempo terminado, activar alarma
+        timer_running = False
+        threading.Thread(target=play_alarm, daemon=True).start()
+        remaining = 0
+    
+    # Mostrar tiempo restante (siempre visible)
+    mins, secs = divmod(remaining, 60)
+    timer_text = f'Tiempo: {mins:02d}:{secs:02d}'
+    
+    # Cambiar color del texto según el estado
+    if remaining == 0:
+        color = (0, 255, 255)  # Amarillo cuando el tiempo terminó
+    elif remaining < 10:
+        color = (0, 0, 255)    # Rojo cuando quedan menos de 10 segundos
+    else:
+        color = (0, 255, 0)    # Verde cuando hay tiempo suficiente
+    
+    cv2.putText(frame, timer_text, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+    
+    # Mostrar estado actual en la pantalla (el resto del texto)
     if show_text:
         status_text = "Lineas: ACTIVADAS" if draw_pose else "Lineas: DESACTIVADAS"
         cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
@@ -153,7 +295,8 @@ while True:
         cv2.putText(frame, "D: Mostrar/Ocultar texto", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     # Mostrar en ventana
-    cv2.imshow("Detector Movimiento OBS", frame)
+    window_title = "Detector Movimiento - Cámara del " + ("Celular" if camera == "phone" else "PC")
+    cv2.imshow(window_title, frame)
     
     # Control de teclado
     key = cv2.waitKey(1) & 0xFF
@@ -189,5 +332,10 @@ while True:
         show_text = not show_text
         print(f"Texto {'mostrado' if show_text else 'ocultado'}")
 
-cap_cam.release()
+# Liberar recursos
+if camera != "phone" and cap_cam is not None:
+    cap_cam.release()
+
+# Detener el hilo del stream del celular
+stop_thread = True
 cv2.destroyAllWindows()
